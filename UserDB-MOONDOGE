@@ -1,0 +1,141 @@
+/**
+ *Submitted for verification at BscScan.com on 2025-07-10
+*/
+
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.24;
+
+interface IUserDB {
+    struct User {
+        bool registered;
+        address referrer;
+    }
+
+    struct Referees {
+        address[] accounts;
+        uint256 size;
+    }
+
+    function getUsers() external view returns (address[] memory);
+    function getTotalUsers() external view returns (uint256);
+    function getUserInfo(address account) external view returns (User memory);
+    function getUserReferees(address account, uint256 deeplevel) external view returns (Referees[] memory);
+    function getUserUpline(address account, uint256 deeplevel) external view returns (address[] memory);
+    function register(address account, address referrer, address root, uint256 deeplevel) external returns (bool);
+}
+
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+}
+
+abstract contract Ownable is Context {
+    address private _owner;
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    modifier onlyOwner() {
+        require(owner() == _msgSender(), "caller is not the owner");
+        _;
+    }
+
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+contract UserDB is Ownable, IUserDB {
+    error Error_On_Permit_Call();
+
+    address[] public users;
+
+    mapping (address => User) user;
+    mapping (address => mapping (address => bool)) public added;
+    mapping (address => mapping (uint256 => address[])) public referees;
+
+    mapping (address => bool) public permit;
+
+    constructor () { updateFrom(); }
+
+    function getUsers() public view returns (address[] memory) { return users; }
+    function getTotalUsers() public view returns (uint256) { return users.length; }
+    function getUserInfo(address account) public view returns (User memory) { return user[account]; }
+
+    function getUserReferees(address account, uint256 deeplevel) public view returns (Referees[] memory) {
+        Referees[] memory result = new Referees[](deeplevel);
+        for (uint256 i; i < deeplevel; i++) {
+            result[i] = Referees(referees[account][i], referees[account][i].length);
+        }
+        return result;
+    }
+
+    function getUserUpline(address account, uint256 deeplevel) public view returns (address[] memory) {
+        address[] memory result = new address[](deeplevel);
+        address referrer = user[account].referrer;
+        for (uint256 i; i < deeplevel; i++) {
+            result[i] = referrer;
+            referrer = user[referrer].referrer;
+        }
+        return result;
+    }
+
+    function register(address account, address referrer, address root, uint256 deeplevel) public returns (bool) {
+        if (user[account].registered) { return false; }
+        if (account == referrer) { return false; }
+        if (!user[referrer].registered && referrer != root) { return false; }
+        if (!permit[_msgSender()]) { revert Error_On_Permit_Call(); }
+        internalRegister(account, referrer, deeplevel);
+        return true;
+    }
+
+    function internalRegister(address account, address referrer, uint256 deeplevel) internal {
+        user[account].registered = true;
+        user[account].referrer = referrer;
+        users.push(account);
+
+        for (uint256 i; i < deeplevel; i++) {
+            if (!added[account][referrer]) {
+                added[account][referrer] = true;
+                referees[referrer][i].push(account);
+            }
+            referrer = user[referrer].referrer;
+        }
+    }
+
+    function updateFrom() internal {
+        IUserDB oldDB = IUserDB(0x6534d3524736470cD1BEe298B4902c0b5fB5E8B0);
+        address[] memory usersLoaded = oldDB.getUsers();
+        uint256 len = usersLoaded.length;
+        for (uint256 i; i < len; i++) {
+            IUserDB.User memory info = oldDB.getUserInfo(usersLoaded[i]);
+            internalRegister(usersLoaded[i], info.referrer, 15);
+        }
+    }
+
+    function flagPermit(address account, bool flag) public onlyOwner {
+        if (account == address(this)) { revert(); }
+        permit[account] = flag;
+    }
+
+    function ownerCall(address to, bytes memory data, uint256 value) public onlyOwner returns (bytes memory) {
+        (bool success,bytes memory result) = to.call{ value: value }(data);
+        require(success);
+        return result;
+    }
+}

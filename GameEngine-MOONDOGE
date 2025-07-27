@@ -1,0 +1,468 @@
+/**
+ *Submitted for verification at BscScan.com on 2025-07-21
+*/
+
+// SPDX-License-Identifier: MIT
+
+pragma solidity 0.8.24;
+
+interface IPair {
+    function getReserves() external view returns (uint112 _reserve0, uint112 _reserve1, uint32 _blockTimestampLast);
+}
+
+interface IERC20 {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address recipient, uint256 amount)external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function transferFrom(address sender, address recipient, uint256 amount) external returns (bool);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+    function mint(address to, uint256 amount) external;
+    function pair() external view returns (address);
+}
+
+interface IGameEngine {
+    function balances(address tokenAddress, address account) external view returns (uint256);
+}
+
+interface ITreasury {
+    function dividend(uint256 amount, uint256 buyback, uint256 moonpump, uint256 marketing, uint256 reserve) external returns (bool);
+}
+
+interface IUserDB {
+    struct User {
+        bool registered;
+        address referrer;
+    }
+
+    struct Referees {
+        address[] accounts;
+        uint256 size;
+    }
+
+    function getUsers() external view returns (address[] memory);
+    function getTotalUsers() external view returns (uint256);
+    function getUserInfo(address account) external view returns (User memory);
+    function getUserReferees(address account, uint256 deeplevel) external view returns (Referees[] memory);
+    function getUserUpline(address account, uint256 deeplevel) external view returns (address[] memory);
+    function register(address account, address referrer, address root, uint256 deeplevel) external returns (bool);
+}
+
+interface IGameNFT {
+    struct Database {
+        string prefix;
+        uint256 totalSupply;
+        uint256 maxWallet;
+        bool publicTransfer;
+    }
+
+    struct Nft {
+        uint256 id;
+        uint256 timstamp;
+        uint256 hash;
+        address minter;
+    }
+
+    function getDatabase() external view returns (Database memory);
+    function getNfts() external view returns (Nft[] memory);
+    function getNftInfo(uint256 tokenid) external view returns (Nft memory);
+    function getOwnerNfts(address account) external view returns (Nft[] memory);
+    function processTokenRequest(address account) external returns (uint256);
+
+    function balanceOf(address owner) external view returns (uint256 balance);
+    function ownerOf(uint256 tokenId) external view returns (address owner);
+    function safeTransferFrom(address from, address to, uint256 tokenId, bytes calldata data) external;
+    function safeTransferFrom(address from, address to, uint256 tokenId) external;
+    function transferFrom(address from, address to, uint256 tokenId) external;
+    function approve(address to, uint256 tokenId) external;
+    function setApprovalForAll(address operator, bool approved) external;
+    function getApproved(uint256 tokenId) external view returns (address operator);
+    function isApprovedForAll(address owner, address operator) external view returns (bool);
+}
+
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+}
+
+abstract contract Ownable is Context {
+    address private _owner;
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor() {
+        _transferOwnership(_msgSender());
+    }
+
+    function owner() public view virtual returns (address) {
+        return _owner;
+    }
+
+    modifier onlyOwner() {
+        require(owner() == _msgSender(), "caller is not the owner");
+        _;
+    }
+
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+contract GameEngineV3 is Ownable {
+    error Not_Enough_Token_Balance(address tokenAddress, uint256 amount, uint256 missing);
+    error Not_Enough_Token_Allowance(address tokenAddress, uint256 amount, uint256 missing);
+    error Nft_Stamina_Already_Filled();
+    error NFT_Out_Of_Stamina();
+    error NFT_Not_Ready_To_Work();
+    error Error_On_Permit_Call();
+    error Exceeded_Wallet_Limit();
+    error Exceeded_Permit_Transfer();
+    error Registeration_Fail();
+    error Not_Match_Fusion_Condition();
+    error Not_Enough_Gas_Fee();
+    error Not_Enough_Credit();
+    error Insufficient_Amount_To_Claim();
+
+    event Mint(address indexed account, IGameNFT.Nft newNft, uint256 amount);
+    event Refill(address indexed account, IGameNFT.Nft newNft, uint256 amount);
+    event Fusion(address indexed account, IGameNFT.Nft tokenA, IGameNFT.Nft tokenB, uint256 amount);
+    event Mining(uint256 indexed tokenid, address indexed recipient, uint256 amount);
+    event ReceivedReward(address indexed tokenAddress, address indexed recipient, uint256 amount, uint256 slot);
+    
+    address constant ZERO = address(0);
+    address constant DEAD = address(0xdead);
+    uint256 constant DEEPLEVEL = 15;
+
+    address constant MDOGE = 0xa8Eacf3C1eE2eDC04e964994e0952708EE4DE9cD;
+    address constant USDT = 0x55d398326f99059fF775485246999027B3197955;
+
+    address constant USERDB = 0xdc0cB06a61B0966b0213347902395552aa55a2F8;
+    address constant NFT = 0x945abF88AF81A047f9A838A8838a119b2301D8ee;
+    address public TREASURY = 0x33d69E75d113c6EEfB5B4928CB0cD126e49879c0;
+
+    IUserDB userdb = IUserDB(USERDB);
+    IGameNFT nft = IGameNFT(NFT);
+    ITreasury treasury = ITreasury(TREASURY);
+
+    IERC20 token = IERC20(MDOGE);
+    IERC20 usdt = IERC20(USDT);
+
+    struct GameRule {
+        uint256 mintPrice;
+        uint256 fusionPrice;
+        uint256 refillPrice;
+        uint256 maxLevel;
+        uint256 denominator;
+        uint256 txgas;
+        uint256[] power;
+        uint256[] energy;
+        uint256[] affiliate;
+        uint256[] matching;
+    }
+
+    GameRule rule;
+
+    struct Charactor {
+        uint256 level;
+        uint256 stamina;
+        uint256 action;
+    }
+
+    mapping (uint256 => Charactor) public charactor;
+
+    address[] path = [ MDOGE, USDT ];
+
+    mapping (address => mapping (address => uint256)) public balances;
+    mapping (address => mapping (address => mapping (uint256 => uint256))) public total;
+
+    constructor () {
+        IERC20(USDT).approve(TREASURY, type(uint256).max);
+        rule.mintPrice = 20e18;
+        rule.fusionPrice = 10e18;
+        rule.refillPrice = 1e17;
+        rule.maxLevel = 5;
+        rule.denominator = 1000;
+        rule.txgas = 1e14;
+        rule.power = [ 2e17, 5e17, 12e17, 29e17, 65e17 ];
+        rule.energy = [ 10, 10, 10, 10, 10 ];
+        rule.affiliate = [ 50, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10 ];
+        rule.matching = [ 20, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3 ];
+        forceupdateAccount();
+        forceupdateNfts();
+    }
+
+    function register(address account, address referrer) internal {
+        if (!userdb.getUserInfo(account).registered) {
+            bool success = userdb.register(account, referrer, address(this), 15);
+            if (!success) { revert Registeration_Fail(); }
+        }
+    }
+
+    function mintNFT(uint256 amount, address account, address referrer) public payable returns (bool) {
+        if (msg.value < rule.txgas) { revert Not_Enough_Gas_Fee(); }
+        internalMint(amount, account, referrer, false);
+        return true;
+    }
+
+    function internalMint(uint256 amount, address account, address referrer, bool skipTransfer) internal {
+        register(account, referrer);
+
+        uint256 payment = amount * rule.mintPrice;
+
+        if (!skipTransfer) {
+            usdt.transferFrom(_msgSender(), address(this), payment);
+            uint256 amountToTreasury = payment * (rule.denominator - sum(rule.affiliate)) / rule.denominator;
+            treasury.dividend(amountToTreasury, 56, 0, 20, 5);
+        }
+
+        paidAffiliate(account, payment);
+
+        for (uint256 i; i < amount; i++) {
+            uint256 tokenid = nft.processTokenRequest(account);
+            charactor[tokenid].stamina = rule.energy[charactor[tokenid].level];
+            charactor[tokenid].level = 1;
+            emit Mint(account, nft.getNftInfo(tokenid), rule.mintPrice);
+        }
+    }
+
+    function forceupdateAccount() internal {
+        address[] memory users = userdb.getUsers();
+        IGameEngine oldengine = IGameEngine(0xA654Dd7Bc31935F7c8e947F32AcE171b88857572);
+        for (uint256 i; i < users.length; i++) {
+            IGameNFT.Nft[] memory nfts = nft.getOwnerNfts(users[i]);
+            uint256 payment = nfts.length * rule.mintPrice;
+            paidAffiliate(users[i], payment);
+            for (uint256 j; j < nfts.length; j++) {
+                uint256 tokenid = nfts[j].id;
+                charactor[tokenid].stamina = 9;
+                charactor[tokenid].level = 1;
+                emit Mint(users[i], nft.getNftInfo(tokenid), rule.mintPrice);
+            }
+        }
+        for (uint256 i; i < users.length; i++) {
+            balances[MDOGE][users[i]] = oldengine.balances(MDOGE, users[i]);
+            balances[USDT][users[i]] = oldengine.balances(USDT, users[i]);
+        }
+    }
+
+    function forceupdateNfts() internal {
+        charactor[2].level = 2;
+        charactor[6].level = 2;
+        charactor[8].level = 2;
+        charactor[13].level = 2;
+        charactor[20].level = 2;
+        charactor[28].level = 2;
+        charactor[68].level = 2;
+        charactor[70].level = 2;
+        charactor[2].stamina = 10;
+        charactor[20].stamina = 10;
+        charactor[28].stamina = 10;
+        charactor[68].stamina = 10;
+        charactor[70].stamina = 10;
+        charactor[0].stamina = 10;
+        charactor[18].stamina = 10;
+        charactor[19].stamina = 10;
+        charactor[54].stamina = 10;
+        charactor[56].stamina = 10;
+        charactor[61].stamina = 10;
+    }
+
+    function getNftsInfo(uint256 tokenid) public view returns (Charactor memory) {
+        return charactor[tokenid];
+    }
+
+    function fusionNFT(uint256 tokenA, uint256 tokenB) public payable returns (bool) {
+        if (msg.value < rule.txgas) { revert Not_Enough_Gas_Fee(); }
+        address account = _msgSender();
+
+        if (!shouldFusion(tokenA, tokenB, 40)) { revert Not_Match_Fusion_Condition(); }
+
+        uint256 payment = getOraclePrice(rule.fusionPrice);
+
+        token.transferFrom(account, MDOGE, payment);
+
+        emit Fusion(account, nft.getNftInfo(tokenA), nft.getNftInfo(tokenB), payment);
+        
+        charactor[tokenA].stamina = rule.energy[charactor[tokenA].level];
+        charactor[tokenA].level++;
+        
+        nft.safeTransferFrom(account, DEAD, tokenB);
+
+        return true;
+    }
+
+    function shouldFusion(uint256 tokenA, uint256 tokenB, uint256 size) public view returns (bool) {
+        if (charactor[tokenA].level != charactor[tokenB].level) { return  false; }
+        return (nft.getNftInfo(tokenA).hash % size) == (nft.getNftInfo(tokenB).hash % size);
+    }
+
+    function refillNFT(uint256 tokenid) public payable returns (bool) {
+        if (msg.value < rule.txgas) { revert Not_Enough_Gas_Fee(); }
+        address account = _msgSender();
+
+        uint256 missingStamina = rule.energy[charactor[tokenid].level - 1] - charactor[tokenid].stamina;
+        if (missingStamina == 0) { revert Nft_Stamina_Already_Filled(); }
+
+        uint256 payment = getOraclePrice(rule.refillPrice * missingStamina);
+
+        token.transferFrom(account, MDOGE, payment);
+
+        charactor[tokenid].stamina = rule.energy[charactor[tokenid].level - 1];
+
+        emit Refill(account, nft.getNftInfo(tokenid), payment);
+
+        return true;
+    }
+
+    function mining(uint256 tokenid) public payable returns (bool) {
+        if (msg.value < rule.txgas) { revert Not_Enough_Gas_Fee(); }
+        address account = nft.ownerOf(tokenid);
+        
+        if (charactor[tokenid].stamina == 0) { revert NFT_Out_Of_Stamina(); }
+        if (charactor[tokenid].action + 1 days > block.timestamp) { revert NFT_Not_Ready_To_Work(); }
+
+        charactor[tokenid].stamina--;
+        charactor[tokenid].action = block.timestamp;
+
+        uint256 amount = getOraclePrice(rule.power[charactor[tokenid].level - 1]);
+
+        balances[MDOGE][account] += amount;
+
+        emit Mining(tokenid, account, amount);
+
+        return true;
+    }
+
+    function claimMDOGE(address referrer) public payable returns (bool) {
+        if (msg.value < rule.txgas) { revert Not_Enough_Gas_Fee(); }
+        address account = _msgSender();
+        register(account, referrer);
+        uint256 amount = balances[MDOGE][account];
+        if (amount==0) { revert Insufficient_Amount_To_Claim(); }
+        balances[MDOGE][account] = 0;
+        token.mint(account, amount);
+        paidMatching(account, amount);
+        return true;
+    }
+
+    function claimUSDT(address referrer) public payable returns (bool) {
+        if (msg.value < rule.txgas) { revert Not_Enough_Gas_Fee(); }
+        address account = _msgSender();
+        register(account, referrer);
+        uint256 amount = balances[USDT][account];
+        if (amount==0) { revert Insufficient_Amount_To_Claim(); }
+        balances[USDT][account] = 0;
+        usdt.transfer(account, amount * 85 / 100);
+        usdt.transfer(TREASURY, amount * 15 / 100);
+        return true;
+    }
+
+    function airdropNFT(uint256 amount, address account, address referrer) public onlyOwner returns (bool) {
+        internalMint(amount, account, referrer, true);
+        return true;
+    }
+
+    function sum(uint256[] memory src) internal pure returns (uint256 result) {
+        for (uint256 i; i < src.length; i++) { result += src[i]; }
+    }
+
+    function paidAffiliate(address account, uint256 amount) internal {
+        address[] memory referrals = userdb.getUserUpline(account, DEEPLEVEL);
+        for (uint256 i; i < DEEPLEVEL; i++) {
+            addBalance(USDT, referrals[i], amount * rule.affiliate[i] / rule.denominator, i);
+        }
+    }
+
+    function paidMatching(address account, uint256 amount) internal {
+        address[] memory referrals = userdb.getUserUpline(account, DEEPLEVEL);
+        for (uint256 i; i < DEEPLEVEL; i++) {
+            addBalance(MDOGE, referrals[i], amount * rule.matching[i] / rule.denominator, i);
+        }
+    }
+
+    function addBalance(address tokenAddress, address recipient, uint256 amount, uint256 slot) internal {
+        balances[tokenAddress][recipient] += amount;
+        total[tokenAddress][recipient][slot] += amount;
+        emit ReceivedReward(tokenAddress, recipient, amount, slot);
+    }
+
+    function getTotals(address tokenA, address tokenB, address accouunt, uint256 deeplevel) public view returns (uint256[] memory, uint256[] memory) {
+        uint256[] memory resultA = new uint256[](deeplevel);
+        uint256[] memory resultB = new uint256[](deeplevel);
+        for (uint256 i; i < deeplevel; i++) {
+            resultA[i] = total[tokenA][accouunt][i];
+            resultB[i] = total[tokenB][accouunt][i];
+        }
+        return (resultA, resultB);
+    }
+
+    function getGameRule() public view returns (GameRule memory) {
+        return rule;
+    }
+
+    function getOraclePrice(uint256 amount) public view returns (uint256) {
+        if (token.pair() == ZERO) { return amount; }
+        IPair pair = IPair(token.pair());
+        (uint112 reserveA, uint112 reserveB,) = pair.getReserves();
+        uint256 price = uint256(reserveA) * 1e18 / uint256(reserveB);
+        return amount * 1e18 / price;
+    }
+
+    function verifyTokenBalance(address account, address tokenAddress, uint256 amount) public view returns (bool) {
+        IERC20 checker = IERC20(token);
+        uint256 balanceOf = checker.balanceOf(account);
+        uint256 allowance = checker.allowance(account, address(this));
+        if (amount > balanceOf) { revert Not_Enough_Token_Balance(tokenAddress, amount, amount - balanceOf); }
+        if (amount > allowance) { revert Not_Enough_Token_Allowance(tokenAddress, amount, amount - allowance); }
+        return true;
+    }
+    
+    function settingGameRule(
+        uint256 mintPrice,
+        uint256 fusionPrice,
+        uint256 refillPrice,
+        uint256 maxLevel,
+        uint256 denominator,
+        uint256 txgas,
+        uint256[] memory power,
+        uint256[] memory energy,
+        uint256[] memory affiliate,
+        uint256[] memory matching
+    ) public onlyOwner {
+        rule.mintPrice = mintPrice;
+        rule.fusionPrice = fusionPrice;
+        rule.refillPrice = refillPrice;
+        rule.maxLevel = maxLevel;
+        rule.denominator = denominator;
+        rule.txgas = txgas;
+        rule.power = power;
+        rule.energy = energy;
+        rule.affiliate = affiliate;
+        rule.matching = matching;
+    }
+
+    function updateTreasury(address treasuryAddress) public onlyOwner {
+        TREASURY = treasuryAddress;
+    }
+
+    function giveAccessRouter(address tokenAddress, address router, uint256 amount) public onlyOwner {
+        IERC20(tokenAddress).approve(router, amount);
+    }
+
+    function ownerCall(address to, bytes memory data, uint256 value) public onlyOwner returns (bytes memory) {
+        (bool success,bytes memory result) = to.call{ value: value }(data);
+        require(success);
+        return result;
+    }
+
+    receive() external payable {}
+}
